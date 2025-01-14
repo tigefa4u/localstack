@@ -1,4 +1,4 @@
-""" Uploading to Tinybird of the metrics collected for a CircleCI run
+"""Uploading to Tinybird of the metrics collected for a CircleCI run
 
 The upload includes:
  * Test Data Raw
@@ -55,24 +55,25 @@ service, operation, parameters, response_code, origin, test_node_id, xfail, aws-
 service, operation, status_code, error_code, is_implemented*
 
 Additionally, we add the following information:
-- *build_id*: the workflow-id (for CircleCI)
+- *build_id*: the workflow-id (for CircleCI) or run-id (for GitHub)
 - *timestamp*: a timestamp as string which will be the same for the CircleCI run
 - *ls_source*: “community” for the CircleCI run, “pro” for the Github action
 
 In order to get more metadata from the build, we also send some general information to tests_raw_builds.datasource:
-- *build_id:* the workflow-id (for CircleCI)
-- *timestamp:* a timestamp as string which will be the same for the CircleCI run
-- *branch:* env value from *`CIRCLE_BRANCH`*
-- *build_url:* env value from *`CIRCLE_BUILD_URL`*
-- *pull_requests:* env value from *`CIRCLE_PULL_REQUESTS`*
-- *build_num:* env value from *`CIRCLE_BUILD_NUM`*
-- *workflow_id:* env value from *`CIRCLE_WORKFLOW_ID`*
+- *build_id:* the workflow-id (for CircleCI) or run-id (for GitHub)
+- *timestamp:* a timestamp as string which will be the same for the CI run
+- *branch:* env value from *`CIRCLE_BRANCH`* or *`GITHUB_HEAD_REF`* (only set for pull_requests) or *`GITHUB_REF_NAME`*
+- *build_url:* env value from *`CIRCLE_BUILD_URL`* or *$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID*
+- *pull_requests:* env value from *`CIRCLE_PULL_REQUESTS`* or *`GITHUB_REF`*
+- *build_num:* env value from *`CIRCLE_BUILD_NUM`* (empty for GitHub, there seems to be no equivalent)
+- *workflow_id:* env value from *`CIRCLE_WORKFLOW_ID`* or *`GITHUB_RUN_ID`*
 """
 
 import csv
 import datetime
 import json
 import os
+from pathlib import Path
 
 import requests
 
@@ -137,21 +138,53 @@ def send_metadata_for_build(build_id: str, timestamp: str):
     CIRCLE_BUILD_NUM=78206
     CIRCLE_BUILD_URL=https://circleci.com/gh/localstack/localstack/78206
     CIRCLE_WORKFLOW_ID=b86a4bc4-bcd1-4170-94d6-4af66846c1c1
+
+    GitHub env examples:
+    GITHUB_REF=ref/heads/master or ref/pull/<pr_number>/merge (will be used for 'pull_requests')
+    GITHUB_HEAD_REF=tinybird_data (used for 'branch', set only for pull_requests)
+    GITHUB_REF_NAME=feature-branch-1 (will be used for 'branch' if GITHUB_HEAD_REF is not set)
+    GITHUB_RUN_ID=1658821493 (will be used for 'workflow_id')
+
+    workflow run's URL (will be used for 'build_url'):
+    $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID
+
+    could not find anything that corresponds to "build_num" (number of current job in CircleCI)
+         -> leaving it blank for Github
     """
+    # on GitHub the GITHUB_HEAD_REF is only set for pull_request, else we use the GITHUB_REF_NAME
+    branch = (
+        os.environ.get("CIRCLE_BRANCH", "")
+        or os.environ.get("GITHUB_HEAD_REF", "")
+        or os.environ.get("GITHUB_REF_NAME", "")
+    )
+    workflow_id = os.environ.get("CIRCLE_WORKFLOW_ID", "") or os.environ.get("GITHUB_RUN_ID", "")
+
+    build_url = os.environ.get("CIRCLE_BUILD_URL", "")
+    if not build_url and os.environ.get("GITHUB_SERVER_URL"):
+        # construct the build-url for Github
+        server = os.environ.get("GITHUB_SERVER_URL", "")
+        repo = os.environ.get("GITHUB_REPOSITORY", "")
+        build_url = f"{server}/{repo}/actions/runs/{workflow_id}"
+
+    pull_requests = os.environ.get("CIRCLE_PULL_REQUESTS", "") or os.environ.get("GITHUB_REF", "")
+    build_num = os.environ.get(
+        "CIRCLE_BUILD_NUM", ""
+    )  # TODO could not find equivalent job-id ENV in github
+
     data = {
         "build_id": build_id,
         "timestamp": timestamp,
-        "branch": os.environ.get("CIRCLE_BRANCH", ""),
-        "build_url": os.environ.get("CIRCLE_BUILD_URL", ""),
-        "pull_requests": os.environ.get("CIRCLE_PULL_REQUESTS", ""),
-        "build_num": os.environ.get("CIRCLE_BUILD_NUM", ""),
-        "workflow_id": os.environ.get("CIRCLE_WORKFLOW_ID", ""),
+        "branch": branch,
+        "build_url": build_url,
+        "pull_requests": pull_requests,
+        "build_num": build_num,
+        "workflow_id": workflow_id,
     }
     data_to_send = [json.dumps(data)]
     send_data_to_tinybird(data_to_send, data_name=DATA_SOURCE_RAW_BUILDS)
 
 
-def send_metric_report(path: str, timestamp: str):
+def send_metric_report(metric_path: str, source_type: str, timestamp: str):
     """
 
     SCHEMA >
@@ -171,38 +204,43 @@ def send_metric_report(path: str, timestamp: str):
     """
     tmp: list[str] = []
     count: int = 0
-    build_id = os.environ.get("CIRCLE_WORKFLOW_ID", "")
+    build_id = os.environ.get("CIRCLE_WORKFLOW_ID", "") or os.environ.get("GITHUB_RUN_ID", "")
     send_metadata_for_build(build_id, timestamp)
-    with open(path, "r") as csv_obj:
-        reader_obj = csv.DictReader(csv_obj)
-        data_to_remove = [field for field in reader_obj.fieldnames if field not in DATA_TO_KEEP]
-        for row in reader_obj:
-            count = count + 1
 
-            # add timestamp, build_id, ls_source
-            row["timestamp"] = timestamp
-            row["build_id"] = build_id
-            row["ls_source"] = "community"
+    pathlist = Path(metric_path).rglob("metric-report-raw-data-*.csv")
+    for path in pathlist:
+        print(f"checking {str(path)}")
+        with open(path, "r") as csv_obj:
+            reader_obj = csv.DictReader(csv_obj)
+            data_to_remove = [field for field in reader_obj.fieldnames if field not in DATA_TO_KEEP]
+            for row in reader_obj:
+                count = count + 1
 
-            # remove data we are currently not interested in
-            for field in data_to_remove:
-                row.pop(field, None)
+                # add timestamp, build_id, ls_source
+                row["timestamp"] = timestamp
+                row["build_id"] = build_id
+                row["ls_source"] = source_type
 
-            # convert boolean values
-            for convert in CONVERT_TO_BOOL:
-                row[convert] = convert_to_bool(row[convert])
+                # remove data we are currently not interested in
+                for field in data_to_remove:
+                    row.pop(field, None)
 
-            tmp.append(json.dumps(row))
-            if len(tmp) == 500:
-                # send data in batches
-                send_data_to_tinybird(tmp, data_name=DATA_SOURCE_RAW_TESTS)
-                tmp.clear()
+                # convert boolean values
+                for convert in CONVERT_TO_BOOL:
+                    row[convert] = convert_to_bool(row[convert])
+
+                tmp.append(json.dumps(row))
+                if len(tmp) == 500:
+                    # send data in batches
+                    send_data_to_tinybird(tmp, data_name=DATA_SOURCE_RAW_TESTS)
+                    tmp.clear()
 
         if tmp:
             # send last batch
             send_data_to_tinybird(tmp, data_name=DATA_SOURCE_RAW_TESTS)
+            tmp.clear()
 
-    print(f"---> processed {count} rows from community test coverage {path}")
+    print(f"---> processed {count} rows from community test coverage {metric_path}")
 
 
 def send_implemented_coverage(file: str, timestamp: str, type: str):
@@ -220,6 +258,7 @@ def send_implemented_coverage(file: str, timestamp: str, type: str):
     tmp: list[str] = []
     count: int = 0
 
+    build_id = os.environ.get("CIRCLE_WORKFLOW_ID", "") or os.environ.get("GITHUB_RUN_ID", "")
     with open(file, "r") as csv_obj:
         reader_obj = csv.DictReader(csv_obj)
         for row in reader_obj:
@@ -234,7 +273,7 @@ def send_implemented_coverage(file: str, timestamp: str, type: str):
             # add timestamp and source
             row["timestamp"] = timestamp
             row["ls_source"] = type
-            row["build_id"] = os.environ.get("CIRCLE_WORKFLOW_ID", "")
+            row["build_id"] = build_id
 
             tmp.append(json.dumps(row))
             if len(tmp) == 500:
@@ -250,35 +289,34 @@ def send_implemented_coverage(file: str, timestamp: str, type: str):
 
 def main():
     token = os.environ.get("TINYBIRD_PARITY_ANALYTICS_TOKEN", "")
-    metric_report = os.environ.get("METRIC_REPORT_PATH", "")
-    community_impl_coverage = os.environ.get("COMMUNITY_IMPL_COV_PATH", "")
-    pro_impl_coverage = os.environ.get("PRO_IMPL_COV_PATH", "")
-
+    metric_report_dir = os.environ.get("METRIC_REPORT_DIR_PATH", "")
+    impl_coverage_file = os.environ.get("IMPLEMENTATION_COVERAGE_FILE", "")
+    source_type = os.environ.get("SOURCE_TYPE", "")
     missing_info = (
         "missing data, please check the available ENVs that are required to run the script"
     )
+    print(
+        f"METRIC_REPORT_DIR_PATH={metric_report_dir}, IMPLEMENTATION_COVERAGE_FILE={impl_coverage_file}, "
+        f"SOURCE_TYPE={source_type}"
+    )
+    if not metric_report_dir:
+        print(missing_info)
+        raise Exception("missing METRIC_REPORT_DIR_PATH")
+    if not impl_coverage_file:
+        print(missing_info)
+        raise Exception("missing IMPLEMENTATION_COVERAGE_FILE")
+    if not source_type:
+        print(missing_info)
+        raise Exception("missing SOURCE_TYPE")
     if not token:
         print(missing_info)
-        print("missing TINYBIRD_PARITY_ANALYTICS_TOKEN")
-        return
-    if not metric_report:
-        print(missing_info)
-        print("missing METRIC_REPORT_PATH")
-        return
-    if not community_impl_coverage:
-        print(missing_info)
-        print("missing COMMUNITY_IMPL_COV_PATH")
-        return
-    if not pro_impl_coverage:
-        print(missing_info)
-        print("missing PRO_IMPL_COV_PATH")
-        return
+        raise Exception("missing TINYBIRD_PARITY_ANALYTICS_TOKEN")
+
     # create one timestamp that will be used for all the data sent
     timestamp: str = datetime.datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
 
-    send_metric_report(metric_report, timestamp)
-    send_implemented_coverage(community_impl_coverage, timestamp=timestamp, type="community")
-    send_implemented_coverage(pro_impl_coverage, timestamp=timestamp, type="pro")
+    send_metric_report(metric_report_dir, source_type=source_type, timestamp=timestamp)
+    send_implemented_coverage(impl_coverage_file, timestamp=timestamp, type=source_type)
 
 
 if __name__ == "__main__":

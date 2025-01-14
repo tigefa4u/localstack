@@ -1,7 +1,7 @@
 import json
 import re
 
-from localstack.services.apigateway.templates import ApiGatewayVtlTemplate
+from localstack.services.apigateway.legacy.templates import ApiGatewayVtlTemplate
 from localstack.utils.aws.templating import render_velocity_template
 
 # template used to transform incoming requests at the API Gateway (forward to Kinesis)
@@ -139,7 +139,7 @@ class TestMessageTransformationBasic:
         #end
         #return('end')
         """
-        result = render_velocity_template(template, {"context": dict()})
+        result = render_velocity_template(template, {"context": {}})
         result = re.sub(r"\s+", " ", result).strip()
         assert result == "loop1 loop3 end"
 
@@ -222,9 +222,17 @@ class TestMessageTransformationApiGateway:
         variables = {"input": {"body": context}}
         template1 = "${foo.bar.strip().lower().replace(' ','-')}"
         template2 = "${foo.bar.trim().toLowerCase().replace(' ','-')}"
-        for template in [template1, template2]:
+        template3 = "${foo.bar.toString().lower().replace(' ','-')}"
+        template4 = '${foo.bar.trim().toLowerCase().replaceAll("^(.*)\\s(.*)$","$1-$2")}'
+        for template in [template1, template2, template3, template4]:
             result = ApiGatewayVtlTemplate().render_vtl(template, variables=variables)
             assert result == "baz-baz"
+
+        contains_template1 = ("${foo.bar.toString().lower().contains('baz')}", "true")
+        contains_template2 = ("${foo.bar.toString().lower().contains('bar')}", "false")
+        for template, expected_result in [contains_template1, contains_template2]:
+            result = ApiGatewayVtlTemplate().render_vtl(template, variables=variables)
+            assert result == expected_result
 
     def test_render_urlencoded_string_data(self):
         template = "MessageBody=$util.base64Encode($input.json('$'))"
@@ -250,3 +258,20 @@ class TestMessageTransformationApiGateway:
         variables = {"method": {"request": {"header": {"X-My-Header": "my-header-value"}}}}
         result = ApiGatewayVtlTemplate().render_vtl(template, variables).strip()
         assert result == "my-header-value"
+
+    def test_boolean_in_variable(self):
+        # Inspired by authorizer context from Lambda authorizer:
+        # https://docs.aws.amazon.com/apigateway/latest/developerguide/api-gateway-lambda-authorizer-output.html
+        # The returned values are all stringified. Notice that you cannot set a JSON
+        # object or array as a valid value of any key in the context map.
+        template = '{"booleanKeyTrue": $booleanKeyTrue, "booleanKeyFalse": $booleanKeyFalse}'
+        variables = {
+            "booleanKeyTrue": "true",
+            "booleanKeyFalse": "false",
+        }
+        result = ApiGatewayVtlTemplate().render_vtl(template, variables)
+        assert "true" in result
+        assert "false" in result
+        assert result == '{"booleanKeyTrue": true, "booleanKeyFalse": false}'
+        # test is valid json
+        json.loads(result)
